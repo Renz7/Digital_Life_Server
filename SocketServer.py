@@ -1,10 +1,10 @@
 import argparse
+import logging
 import os
 import socket
 import time
-import logging
 import traceback
-from logging.handlers import TimedRotatingFileHandler
+from multiprocessing.pool import ThreadPool
 
 import librosa
 import requests
@@ -12,11 +12,11 @@ import revChatGPT
 import soundfile
 
 import GPT.tune
-from utils.FlushingFileHandler import FlushingFileHandler
 from ASR import ASRService
 from GPT import GPTService
-from TTS import TTService
 from SentimentEngine import SentimentEngine
+from TTS import TTService
+from utils.FlushingFileHandler import FlushingFileHandler
 
 console_logger = logging.getLogger()
 console_logger.setLevel(logging.INFO)
@@ -39,6 +39,7 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Unsupported value encountered.')
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--chatVer", type=int, nargs='?', required=True)
@@ -59,8 +60,7 @@ def parse_args():
 class Server():
     def __init__(self, args):
         # SERVER STUFF
-        self.addr = None
-        self.conn = None
+        self.pool = None
         logging.info('Initializing Server...')
         self.host = socket.gethostbyname(socket.gethostname())
         self.port = 38438
@@ -90,56 +90,63 @@ class Server():
         # Sentiment Engine
         self.sentiment = SentimentEngine.SentimentEngine('SentimentEngine/models/paimon_sentiment.onnx')
 
+    def handler(self, conn, addr):
+        logging.info(f"Connected by {addr}")
+        conn.sendall(b'%s' % self.char_name[args.character][2].encode())
+        while True:
+            try:
+                file = self.__receive_file(conn)
+                # print('file received: %s' % file)
+                with open(self.tmp_recv_file, 'wb') as f:
+                    f.write(file)
+                    logging.info('WAV file received and saved.')
+                ask_text = self.process_voice()
+                if args.stream:
+                    for sentence in self.chat_gpt.ask_stream(ask_text):
+                        self.send_voice(conn, sentence)
+                    self.notice_stream_end(conn)
+                    logging.info('Stream finished.')
+                else:
+                    resp_text = self.chat_gpt.ask(ask_text, convo_id="%s" % addr)
+                    self.send_voice(conn, resp_text)
+                    self.notice_stream_end(conn)
+            except revChatGPT.typings.APIConnectionError as e:
+                logging.error(e.__str__())
+                logging.info('API rate limit exceeded, sending: %s' % GPT.tune.exceed_reply)
+                self.send_voice(conn, GPT.tune.exceed_reply, 2)
+                self.notice_stream_end(conn)
+            except revChatGPT.typings.Error as e:
+                logging.error(e.__str__())
+                logging.info('Something wrong with OPENAI, sending: %s' % GPT.tune.error_reply)
+                self.send_voice(conn, GPT.tune.error_reply, 1)
+                self.notice_stream_end(conn)
+            except requests.exceptions.RequestException as e:
+                logging.error(e.__str__())
+                logging.info('Something wrong with internet, sending: %s' % GPT.tune.error_reply)
+                self.send_voice(conn, GPT.tune.error_reply, 1)
+                self.notice_stream_end(conn)
+            except Exception as e:
+                logging.error(e.__str__())
+                logging.error(traceback.format_exc())
+                conn.close()
+                break
+
     def listen(self):
         # MAIN SERVER LOOP
+        self.pool = ThreadPool(17)
+
         while True:
-            self.s.listen()
+            self.s.listen(5)
             logging.info(f"Server is listening on {self.host}:{self.port}...")
-            self.conn, self.addr = self.s.accept()
-            logging.info(f"Connected by {self.addr}")
-            self.conn.sendall(b'%s' % self.char_name[args.character][2].encode())
-            while True:
-                try:
-                    file = self.__receive_file()
-                    # print('file received: %s' % file)
-                    with open(self.tmp_recv_file, 'wb') as f:
-                        f.write(file)
-                        logging.info('WAV file received and saved.')
-                    ask_text = self.process_voice()
-                    if args.stream:
-                        for sentence in self.chat_gpt.ask_stream(ask_text):
-                            self.send_voice(sentence)
-                        self.notice_stream_end()
-                        logging.info('Stream finished.')
-                    else:
-                        resp_text = self.chat_gpt.ask(ask_text)
-                        self.send_voice(resp_text)
-                        self.notice_stream_end()
-                except revChatGPT.typings.APIConnectionError as e:
-                    logging.error(e.__str__())
-                    logging.info('API rate limit exceeded, sending: %s' % GPT.tune.exceed_reply)
-                    self.send_voice(GPT.tune.exceed_reply, 2)
-                    self.notice_stream_end()
-                except revChatGPT.typings.Error as e:
-                    logging.error(e.__str__())
-                    logging.info('Something wrong with OPENAI, sending: %s' % GPT.tune.error_reply)
-                    self.send_voice(GPT.tune.error_reply, 1)
-                    self.notice_stream_end()
-                except requests.exceptions.RequestException as e:
-                    logging.error(e.__str__())
-                    logging.info('Something wrong with internet, sending: %s' % GPT.tune.error_reply)
-                    self.send_voice(GPT.tune.error_reply, 1)
-                    self.notice_stream_end()
-                except Exception as e:
-                    logging.error(e.__str__())
-                    logging.error(traceback.format_exc())
-                    break
+            conn, addr = self.s.accept()
+            logging.info("Connected by %s" % str(addr))
+            self.pool.apply_async(self.handler, (conn, addr))
 
-    def notice_stream_end(self):
+    def notice_stream_end(self, conn):
         time.sleep(0.5)
-        self.conn.sendall(b'stream_finished')
+        conn.sendall(b'stream_finished')
 
-    def send_voice(self, resp_text, senti_or = None):
+    def send_voice(self, conn, resp_text, senti_or=None):
         self.tts.read_save(resp_text, self.tmp_proc_file, self.tts.hps.data.sampling_rate)
         with open(self.tmp_proc_file, 'rb') as f:
             senddata = f.read()
@@ -149,16 +156,16 @@ class Server():
             senti = self.sentiment.infer(resp_text)
         senddata += b'?!'
         senddata += b'%i' % senti
-        self.conn.sendall(senddata)
+        conn.sendall(senddata)
         time.sleep(0.5)
         logging.info('WAV SENT, size %i' % len(senddata))
 
-    def __receive_file(self):
+    def __receive_file(self, conn):
         file_data = b''
         while True:
-            data = self.conn.recv(1024)
+            data = conn.recv(1024)
             # print(data)
-            self.conn.send(b'sb')
+            conn.send(b'sb')
             if data[-2:] == b'?!':
                 file_data += data[0:-2]
                 break

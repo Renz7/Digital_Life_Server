@@ -51,10 +51,10 @@ class GPTService():
             self.chatbot = Chatbot(api_key=api_key, proxy=args.proxy, system_prompt=self.tune)
             logging.info('API Chatbot initialized.')
 
-    def ask(self, text):
+    def ask(self, text, convo_id="default"):
         stime = time.time()
         if self.chatVer == 3:
-            prev_text = self.chatbot.ask(text)
+            prev_text = self.chatbot.ask(text, convo_id=convo_id)
 
         # V1
         elif self.chatVer == 1:
